@@ -10,6 +10,7 @@ const Token = struct {
         rp,
         quote,
         int,
+        float,
         sym,
         str,
         eof,
@@ -32,6 +33,7 @@ const Tokenizer = struct {
         start,
         sym,
         int,
+        float,
         str,
         str_escape,
     };
@@ -83,7 +85,7 @@ const Tokenizer = struct {
                     result.loc.start = self.index;
                     continue :state .start;
                 },
-                'a'...'z', 'A'...'Z', '_', '+', '-', '*', '/' => {
+                'a'...'z', 'A'...'Z', '_', '+', '-', '*', '/', '!', '<'...'>' => {
                     result.tag = .sym;
                     continue :state .sym;
                 },
@@ -135,7 +137,7 @@ const Tokenizer = struct {
             .sym => {
                 self.index += 1;
                 switch (self.buffer[self.index]) {
-                    'a'...'z', 'A'...'Z', '_', '0'...'9', '+', '-', '*', '/' => continue :state .sym,
+                    'a'...'z', 'A'...'Z', '_', '0'...'9', '+', '-', '*', '/', '!', '<'...'>' => continue :state .sym,
                     else => {},
                 }
             },
@@ -144,8 +146,16 @@ const Tokenizer = struct {
                 self.index += 1;
                 switch (self.buffer[self.index]) {
                     '0'...'9' => continue :state .int,
+                    '.' => continue :state .float,
                     else => {},
                 }
+            },
+
+            .float => {
+                self.index += 1;
+                if (result.tag == .float) @panic("lex fail, found 2 . in float");
+                result.tag = .float;
+                continue :state .int;
             },
         }
 
@@ -234,10 +244,11 @@ const Parse = struct {
         const text = p.source[tok.loc.start..tok.loc.end];
 
         const node: Ast.Node = nd: switch (tok.tag) {
-            .int, .str, .sym, .quote => Ast.Node{
+            .int, .float, .str, .sym, .quote => Ast.Node{
                 .main_token = i,
                 .data = switch (tok.tag) {
                     .int => .{ .int = try std.fmt.parseInt(i32, text, 10) },
+                    .float => .{ .float = try std.fmt.parseFloat(f64, text) },
                     .str => .{ .str = text },
                     .sym => .{ .sym = text },
                     .quote => .{ .expr = &.{ try p.addQuoteNode(i), try p.parseExpr() } },
@@ -279,6 +290,7 @@ const Ast = struct {
         root: []const NodeIndex,
         expr: []const NodeIndex,
         int: i32,
+        float: f64,
         sym: []const u8,
         str: []const u8,
     };
@@ -327,24 +339,77 @@ const Interp = struct {
     ast: Ast,
     bound: std.StringHashMap(Value),
 
+    const Enviornment = struct {
+        bound: std.StringHashMap(Value),
+        parent: *Enviornment,
+    };
+
     const ValueData = union(enum) {
         int: i32,
+        float: f64,
+        bool: bool,
         sym: []const u8,
         str: []const u8,
         // todo figure out whether lst is a function as well
         lst: []const Value,
         bif: *const fn (*Interp, args: []Value) Value,
+        bim: *const fn (*Interp, args: []Value) Value,
     };
+
     const Value = struct {
         data: ValueData,
-        history: *HistoryNode,
+        history: *const HistoryNode,
 
         // should nil values have history? probably, but for now..
         const nil: Value = .{ .data = .{ .lst = &.{} }, .history = undefined };
     };
 
+    fn init(allocator: std.mem.Allocator, ast: Ast) !Interp {
+        var interp: Interp = .{
+            .gpa = allocator,
+            .ast = ast,
+            .bound = std.StringHashMap(Interp.Value).init(allocator),
+        };
+
+        _ = try interp.bound.put("true", .{ .data = .{ .bool = true }, .history = &.builtin });
+        _ = try interp.bound.put("false", .{ .data = .{ .bool = false }, .history = &.builtin });
+
+        return interp;
+    }
+    fn inspect(i: Interp, value: Value) void {
+        return i.inspectOptions(value, 0);
+    }
+
+    fn inspectOptions(i: Interp, value: Value, tabs: u32) void {
+        const tab_str = i.gpa.alloc(u8, tabs) catch @panic("oom");
+        defer i.gpa.free(tab_str);
+        @memset(tab_str, '\t');
+        std.debug.print("{s}value: {any}\n", .{ tab_str, value.data });
+        var next: ?*const HistoryNode = value.history;
+        while (next) |hist| {
+            switch (hist.data) {
+                .creation => |c| std.debug.print("{s}created @ character {d}\n", .{ tab_str, c }),
+                .call => |c| {
+                    std.debug.print("{s}call \"{s}\" @ character {d} with {d} arguments:\n", .{
+                        tab_str,
+                        c.fn_name,
+                        i.ast.tokens[i.ast.nodes[c.node].main_token].loc.start,
+                        c.args.len,
+                    });
+
+                    for (c.args) |arg| {
+                        i.inspectOptions(arg, tabs + 1);
+                    }
+                },
+                .builtin => std.debug.print("{s}built in", .{tab_str}),
+                .macro => std.debug.print("{s}constructed at macro", .{tab_str}),
+            }
+            next = hist.next;
+        }
+    }
+
     const HistoryNode = struct {
-        next: ?*HistoryNode,
+        next: ?*const HistoryNode,
         data: union(enum) {
             // creation line number (for now it points to source index)
             creation: usize,
@@ -354,17 +419,21 @@ const Interp = struct {
                 fn_name: []const u8,
                 args: []const Value,
             },
+            builtin: void,
+            macro: void,
         },
+        const builtin: HistoryNode = .{ .next = null, .data = .builtin };
     };
 
     fn evalRoot(i: *Interp) !void {
         for (i.ast.root_node.data.root) |expr| {
-            _ = try i.eval(i.ast.nodes[expr]);
+            _ = try i.eval(expr);
         }
     }
 
-    fn creationNode(i: *Interp, node: Ast.Node) !*HistoryNode {
+    fn creationNode(i: *Interp, node_i: NodeIndex) !*const HistoryNode {
         const hist = try i.gpa.create(HistoryNode);
+        const node = i.ast.nodes[node_i];
         hist.* = .{
             .next = null,
             .data = .{ .creation = i.ast.tokens[node.main_token].loc.start },
@@ -386,73 +455,85 @@ const Interp = struct {
         };
     }
 
-    fn createValue(i: *Interp, comptime field_name: []const u8, data: GetValueDataFieldType(field_name), node: Ast.Node) Value {
+    fn createValue(i: *Interp, comptime field_name: []const u8, data: GetValueDataFieldType(field_name), node: NodeIndex) Value {
         return .{
             .data = @unionInit(ValueData, field_name, data),
             .history = i.creationNode(node) catch @panic("oom"),
         };
     }
 
-    // TODO switch to NodeIndexes because they actually make code cleaner (no use of index of)
-    fn eval(i: *Interp, node: Ast.Node) !Value {
-        return val: switch (node.data) {
-            .int => |num| break :val i.createValue("int", num, node),
-            .str => |str| break :val i.createValue("str", str, node),
-            .sym => |sym| break :val i.bound.get(sym) orelse @panic("unbound variable"),
+    fn nodeToValue(i: *Interp, node: NodeIndex) !Value {
+        const atom = i.ast.nodes[node];
+
+        return val: switch (atom.data) {
+            .int, .float, .str => try i.eval(node),
+            .sym => |sym| i.createValue("sym", sym, node),
+            .expr => |expr| {
+                var values = try i.gpa.alloc(Value, expr.len);
+                for (expr, 0..) |child, child_i| {
+                    values[child_i] = try i.nodeToValue(child);
+                }
+
+                break :val i.createValue("lst", values, node);
+            },
+            .root => unreachable,
+        };
+    }
+
+    // TODO rework this to the sig `fn eval(i: *Interp, value: Value) ...
+    // since in lisp, values are syntax!
+    fn eval(i: *Interp, node: NodeIndex) std.mem.Allocator.Error!Value {
+        return val: switch (i.ast.nodes[node].data) {
+            .int => |num| i.createValue("int", num, node),
+            .float => |num| i.createValue("float", num, node),
+            .str => |str| i.createValue("str", str, node),
+            .sym => |sym| i.bound.get(sym) orelse @panic("unbound variable"),
             .expr => |expr| {
                 if (expr.len == 0) break :val i.createValue("lst", &.{}, node);
                 switch (i.ast.nodes[expr[0]].data) {
                     .sym => |fn_name| {
-                        if (std.mem.eql(u8, fn_name, "quote")) {
-                            if (expr.len != 2) @panic("quote called with wrong number of arguments");
-                            const quoted = i.ast.nodes[expr[1]];
-                            var values = try i.gpa.alloc(Value, quoted.data.expr.len);
-                            // todo make sure is expr
-                            for (quoted.data.expr, 0..) |atom_id, vi| {
-                                const atom = i.ast.nodes[atom_id];
+                        // TODO instead of hard coding this make it a bif_macro
+                        const symbol = i.bound.get(fn_name) orelse @panic("tried to call unbound variable");
 
-                                // TODO this doesn't work with outher expressions, we'll need a seperate quote function
-                                // that does this type of thing recrusively.
-                                values[vi] = switch (atom.data) {
-                                    .sym => |sym| i.createValue("sym", sym, quoted),
-                                    else => try i.eval(atom),
-                                };
-                            }
-                            break :val i.createValue("lst", values, quoted);
-                        } else {
-                            const symbol = i.bound.get(fn_name);
-                            var args = try i.gpa.alloc(Value, expr.len - 1);
-                            for (expr[1..], 0..) |atom_id, vi| {
-                                const atom = i.ast.nodes[atom_id];
-                                args[vi] = try i.eval(atom);
-                            }
-
-                            if (symbol) |fun| {
-                                switch (fun.data) {
-                                    .bif => |proc| {
-                                        // TODO if the number of arguments is 1 or we see a rebind
-                                        // attach the history to the value
-                                        // otherwise just create a new value
-                                        var res = proc(i, args);
-                                        const hist = try i.gpa.create(HistoryNode);
-                                        hist.* = .{
-                                            .next = null,
-                                            .data = .{
-                                                .call = .{
-                                                    // TODO fix node pointing
-                                                    .node = 999,
-                                                    .fn_name = fn_name,
-                                                    .args = args,
-                                                },
-                                            },
-                                        };
-
-                                        res.history = hist;
-                                        break :val res;
-                                    },
-                                    else => @panic("i dunno how to call this."),
+                        switch (symbol.data) {
+                            .bif => |proc| {
+                                var args = try i.gpa.alloc(Value, expr.len - 1);
+                                for (expr[1..], 0..) |atom_id, vi| {
+                                    args[vi] = try i.eval(atom_id);
                                 }
-                            }
+                                // TODO if the number of arguments is 1 or we see a rebind
+                                // attach the history to the value
+                                // otherwise just create a new value
+                                var res = proc(i, args);
+                                const hist = try i.gpa.create(HistoryNode);
+                                hist.* = .{
+                                    .next = null,
+                                    .data = .{
+                                        .call = .{
+                                            .node = node,
+                                            .fn_name = fn_name,
+                                            .args = args,
+                                        },
+                                    },
+                                };
+
+                                res.history = hist;
+                                break :val res;
+                            },
+                            .bim => |proc| {
+                                // TODO add macro expansion as a history node type
+                                var args = try i.gpa.alloc(Value, expr.len - 1);
+                                for (expr[1..], 0..) |atom_id, vi| {
+                                    args[vi] = try i.nodeToValue(atom_id);
+                                }
+
+                                var res = proc(i, args);
+                                const hist = try i.gpa.create(HistoryNode);
+                                hist.* = .{ .next = null, .data = .macro };
+                                res.history = hist;
+                                // TODO i think i need to evaluate this, but also it relies on chunk indexes which causes problems...
+                            },
+                            else => @panic("i dunno how to call this."),
                         }
                     },
 
@@ -475,36 +556,89 @@ const Interp = struct {
 const stdout = std.io.getStdOut();
 const out_writer = stdout.writer();
 
-fn theia_print(i: *Interp, args: []Interp.Value) Interp.Value {
-    _ = i;
-    std.debug.assert(args.len == 1);
-    std.debug.print("INSPECT: {any}\n", .{args[0].history.*.data.call});
-    switch (args[0].data) {
-        .str => |str| out_writer.print("{s}\n", .{str}) catch @panic("write failed"),
-        .int => |int| out_writer.print("{d}\n", .{int}) catch @panic("write failed"),
-        else => @panic("unimplemented"),
+const TheiaBuiltin = struct {
+    const Binding = struct {
+        []const u8,
+        *const fn (*Interp, args: []Interp.Value) Interp.Value,
+    };
+    const bifs: []const Binding = &[_]Binding{
+        .{ "print", &print },
+        .{ "+", &add },
+    };
+
+    const bims: []const Binding = &[_]Binding{
+        .{ "quote", &quote },
+        .{ "if", &ifs },
+    };
+
+    fn attach(i: *Interp) !void {
+        for (bifs) |tup| {
+            const name, const fun = tup;
+            try i.bound.put(name, .{
+                .data = .{ .bif = fun },
+                .history = &.builtin,
+            });
+        }
+
+        for (bims) |tup| {
+            const name, const fun = tup;
+            try i.bound.put(name, .{
+                .data = .{ .bim = fun },
+                .history = &.builtin,
+            });
+        }
     }
 
-    return .nil;
-}
+    // macros
+    fn quote(i: *Interp, args: []Interp.Value) Interp.Value {
+        std.debug.assert(args.len == 1);
+        _ = i;
 
-fn theia_add(i: *Interp, args: []Interp.Value) Interp.Value {
-    _ = i;
-    switch (args[0].data) {
-        .str => {
-            // str concat
-            return .nil;
-        },
-        .int => {
-            var res: i32 = 0;
-            for (args) |arg| {
-                res += arg.data.int;
-            }
-            return Interp.createValueNoHistory("int", res);
-        },
-        else => @panic("unimplemented"),
+        return args[0];
     }
-}
+
+    fn ifs(i: *Interp, args: []Interp.Value) Interp.Value {
+        _ = i;
+        std.debug.assert(args.len == 2 or args.len == 3);
+        return switch (args[0].data) {
+            // .bool => |b| if (b) i.eval(args[1]) catch @panic("oom") else if (args.len == 3) i.eval(args[2]) catch @panic("oom") else .nil,
+            else => @panic("condition not boolean"),
+        };
+    }
+
+    // functions
+
+    fn print(i: *Interp, args: []Interp.Value) Interp.Value {
+        std.debug.assert(args.len == 1);
+        i.inspect(args[0]);
+        switch (args[0].data) {
+            .str => |str| out_writer.print("{s}\n", .{str}) catch @panic("write failed"),
+            .int => |int| out_writer.print("{d}\n", .{int}) catch @panic("write failed"),
+            .float => |float| out_writer.print("{d}\n", .{float}) catch @panic("write failed"),
+            else => @panic("unimplemented"),
+        }
+
+        return .nil;
+    }
+
+    fn add(i: *Interp, args: []Interp.Value) Interp.Value {
+        _ = i;
+        switch (args[0].data) {
+            .str => {
+                // str concat
+                return .nil;
+            },
+            .int => {
+                var res: i32 = 0;
+                for (args) |arg| {
+                    res += arg.data.int;
+                }
+                return Interp.createValueNoHistory("int", res);
+            },
+            else => @panic("unimplemented"),
+        }
+    }
+};
 
 pub fn main() !void {
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
@@ -529,29 +663,21 @@ pub fn main() !void {
     const ast = try Ast.parse(allocator, source);
     for (ast.nodes, 0..) |node, i| {
         switch (node.data) {
-            .int => |d| std.debug.print("{d} - int node {d}\n", .{ i, d }),
-            .expr => |e| std.debug.print("{d} - expr node {any}\n", .{ i, e }),
-            .root => |r| std.debug.print("{d} - root node {any}\n", .{ i, r }),
-            .str => |s| std.debug.print("{d} - str node {s}\n", .{ i, s }),
-            .sym => |s| std.debug.print("{d} - sym node {s}\n", .{ i, s }),
+            inline else => |v| std.debug.print("{d} - {s} node {any}\n", .{ i, @tagName(node.data), v }),
         }
+        // switch (node.data) {
+        //     .int => |d| ,
+        //     .float => |f| std.debug.print("{d} - float node {d}", .{ i, f }),
+        //     .bool => |b| std.debug.print("{d} - bool node {any}", .{ i, b }),
+        //     .expr => |e| std.debug.print("{d} - expr node {any}\n", .{ i, e }),
+        //     .root => |r| std.debug.print("{d} - root node {any}\n", .{ i, r }),
+        //     .str => |s| std.debug.print("{d} - str node {s}\n", .{ i, s }),
+        //     .sym => |s| std.debug.print("{d} - sym node {s}\n", .{ i, s }),
+        // }
     }
 
-    var interp: Interp = .{
-        .gpa = allocator,
-        .ast = ast,
-        .bound = std.StringHashMap(Interp.Value).init(allocator),
-    };
-    try interp.bound.put("print", .{
-        .data = .{ .bif = &theia_print },
-        .history = undefined,
-    });
+    var interp: Interp = try .init(allocator, ast);
 
-    try interp.bound.put("+", .{
-        .data = .{ .bif = &theia_add },
-        .history = undefined,
-    });
-
+    try TheiaBuiltin.attach(&interp);
     try interp.evalRoot();
-    // std.debug.print("{any}", .{ast.nodes});
 }
