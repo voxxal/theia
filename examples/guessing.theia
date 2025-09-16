@@ -1,0 +1,27 @@
+(def guess-routine '(num) 
+	(
+		(print "Guess the number between 1 and 100")
+		(let 'guess (int h) (or (atoi! readline) 0))
+		(cond
+			((= guess num) 
+				(
+					(print "Congrats! You guessed it")
+					true
+				))
+			((< guess num)
+				(
+					(print "Too low")
+					(guess-routine num)
+				))
+			((> guess num)
+				(
+					(print "Too high")
+					(guess-routine num)
+				))
+		)
+	))
+
+(def main nil 
+	(
+		(let 'num (int h) (floor (* (rand) 100.0)))
+		(guess-routine num)))

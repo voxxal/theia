@@ -1,0 +1,14 @@
+(def handle-request '(req) 
+    (match req.path 
+        ("/" (h1 "Hello World!"))
+        ("/greet" (h1 (+ "Hello " req.params.name "!")))
+    )
+)
+
+(def main nil
+    (
+        (let 'socket (socket AF_INET SOCK_STREAM 0))
+        (bind socket 3000)
+        (listen socket handle-request)
+    )
+)
